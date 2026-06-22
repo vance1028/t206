@@ -84,6 +84,87 @@ def _detect_temp_anomalies(
     return sub.sort_values("timestamp").reset_index(drop=True), issues
 
 
+def _check_harvest_timeline_consistency(
+    batch_id: str,
+    batch_row: pd.Series,
+    sub_temps: pd.DataFrame,
+) -> List[DataIssue]:
+    issues: List[DataIssue] = []
+    if sub_temps.empty:
+        return issues
+
+    harvest_time = pd.Timestamp(batch_row.get("harvest_time"))
+    if pd.isna(harvest_time):
+        issues.append(DataIssue(
+            issue_type="missing_harvest_time",
+            batch_id=batch_id,
+            description="批次采收时间缺失",
+            severity="error",
+        ))
+        return issues
+
+    stage_times = sub_temps.groupby("stage")["timestamp"].agg(["min", "max"])
+
+    for stage in STAGES:
+        if stage not in stage_times.index:
+            continue
+        stage_sub = sub_temps[sub_temps["stage"] == stage]
+        if len(stage_sub) >= 2:
+            timestamps = stage_sub["timestamp"].values
+            for i in range(1, len(timestamps)):
+                if timestamps[i] < timestamps[i - 1]:
+                    issues.append(DataIssue(
+                        issue_type="stage_time_inversion",
+                        batch_id=batch_id,
+                        stage=stage,
+                        description=f"{STAGE_NAMES_CN[stage]}内存在时间倒序: 第{i}条{pd.Timestamp(timestamps[i]).strftime('%Y-%m-%d %H:%M')} < 第{i-1}条{pd.Timestamp(timestamps[i-1]).strftime('%Y-%m-%d %H:%M')}",
+                        severity="error",
+                    ))
+                    break
+
+    for stage in STAGES:
+        if stage not in stage_times.index:
+            continue
+        stage_min = stage_times.loc[stage, "min"]
+        stage_max = stage_times.loc[stage, "max"]
+
+        if stage == "harvest":
+            if stage_min < harvest_time - pd.Timedelta(minutes=1):
+                issues.append(DataIssue(
+                    issue_type="harvest_time_anomaly",
+                    batch_id=batch_id,
+                    stage=stage,
+                    description=f"采收记录早于批次采收时间: 记录{stage_min.strftime('%Y-%m-%d %H:%M')} < 批次{harvest_time.strftime('%Y-%m-%d %H:%M')}",
+                    severity="error",
+                ))
+            continue
+
+        if stage_min < harvest_time:
+            issues.append(DataIssue(
+                issue_type="stage_before_harvest",
+                batch_id=batch_id,
+                stage=stage,
+                description=f"{STAGE_NAMES_CN[stage]}记录早于采收时间: {stage_min.strftime('%Y-%m-%d %H:%M')} < {harvest_time.strftime('%Y-%m-%d %H:%M')}",
+                severity="error",
+            ))
+
+    if "harvest" in stage_times.index:
+        harvest_max = stage_times.loc["harvest", "max"]
+        next_stages = [s for s in STAGES[1:] if s in stage_times.index]
+        for ns in next_stages:
+            ns_min = stage_times.loc[ns, "min"]
+            if ns_min < harvest_max:
+                issues.append(DataIssue(
+                    issue_type="stage_before_harvest_end",
+                    batch_id=batch_id,
+                    stage=ns,
+                    description=f"{STAGE_NAMES_CN[ns]}开始早于采收结束: {ns_min.strftime('%Y-%m-%d %H:%M')} < {harvest_max.strftime('%Y-%m-%d %H:%M')}",
+                    severity="error",
+                ))
+
+    return issues
+
+
 def validate_batch(
     batch_id: str,
     batches_df: pd.DataFrame,
@@ -101,7 +182,8 @@ def validate_batch(
         ))
         return issues
 
-    category = batch_row.iloc[0]["category"]
+    batch_row = batch_row.iloc[0]
+    category = batch_row["category"]
     sub_temps = temps_df[temps_df["batch_id"] == batch_id].copy()
     present_stages = set(sub_temps["stage"].unique()) if not sub_temps.empty else set()
 
@@ -115,6 +197,9 @@ def validate_batch(
                 severity="warning",
             ))
 
+    harvest_issues = _check_harvest_timeline_consistency(batch_id, batch_row, sub_temps)
+    issues.extend(harvest_issues)
+
     if not sub_temps.empty:
         stage_times = sub_temps.groupby("stage")["timestamp"].agg(["min", "max"])
         prev_max = None
@@ -122,15 +207,25 @@ def validate_batch(
         for stage in STAGES:
             if stage in stage_times.index:
                 cur_min = stage_times.loc[stage, "min"]
+                cur_max = stage_times.loc[stage, "max"]
+                if cur_max < cur_min:
+                    issues.append(DataIssue(
+                        issue_type="stage_time_inversion",
+                        batch_id=batch_id,
+                        stage=stage,
+                        description=f"{STAGE_NAMES_CN[stage]}环节时间倒序: 结束{cur_max} < 开始{cur_min}",
+                        severity="error",
+                    ))
                 if prev_max is not None and cur_min < prev_max:
                     issues.append(DataIssue(
                         issue_type="time_overlap",
                         batch_id=batch_id,
                         stage=stage,
-                        description=f"环节时间倒序: {STAGE_NAMES_CN.get(prev_stage, prev_stage)} -> {STAGE_NAMES_CN.get(stage, stage)}",
+                        description=f"环节时间倒序/重叠: {STAGE_NAMES_CN.get(prev_stage, prev_stage)} -> {STAGE_NAMES_CN.get(stage, stage)}",
                         severity="error",
                     ))
-                prev_max = stage_times.loc[stage, "max"]
+                if prev_max is None or cur_max > prev_max:
+                    prev_max = cur_max
                 prev_stage = stage
 
     return issues

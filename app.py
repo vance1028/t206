@@ -43,9 +43,54 @@ RISK_CN = {"normal": "正常", "warning": "临期预警", "critical": "高危"}
 STAGE_COLORS = px.colors.qualitative.Set2[: len(STAGES)]
 
 
+BATCHES_REQUIRED_COLS = ["batch_id", "category", "line_id", "origin", "dest", "harvest_time", "loss_rate", "weight_kg"]
+TEMPS_REQUIRED_COLS = ["batch_id", "stage", "timestamp", "temperature"]
+
+
+def _parse_uploaded_file(uploaded_file, required_cols: list, name: str) -> pd.DataFrame | None:
+    if uploaded_file is None:
+        return None
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        elif uploaded_file.name.endswith(".xlsx") or uploaded_file.name.endswith(".xls"):
+            df = pd.read_excel(uploaded_file)
+        else:
+            st.error(f"不支持的{name}文件格式，请上传 CSV 或 Excel 文件")
+            return None
+    except Exception as e:
+        st.error(f"读取{name}文件失败: {e}")
+        return None
+
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"{name}缺少必要列: {', '.join(missing)}")
+        st.info(f"需要包含这些列: {', '.join(required_cols)}")
+        return None
+
+    if "harvest_time" in df.columns:
+        df["harvest_time"] = pd.to_datetime(df["harvest_time"], errors="coerce")
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+    if "category_cn" not in df.columns and "category" in df.columns:
+        df["category_cn"] = df["category"].map(
+            {k: v.name_cn for k, v in PRODUCT_CATEGORIES.items()}
+        ).fillna(df["category"])
+    if "stage_cn" not in df.columns and "stage" in df.columns:
+        df["stage_cn"] = df["stage"].map(STAGE_NAMES_CN).fillna(df["stage"])
+
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def load_data(n_batches: int, seed: int):
     return generate_sample_data(n_batches=n_batches, seed=seed)
+
+
+@st.cache_data(show_spinner=False)
+def load_empty_df() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    return pd.DataFrame(), pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False)
@@ -110,11 +155,42 @@ def _filter_data(
 
 
 def build_sidebar():
-    st.sidebar.header("⚙️ 分析参数")
+    st.sidebar.header("📁 数据源")
 
-    with st.sidebar.expander("📦 数据生成", expanded=False):
-        n_batches = st.slider("模拟批次数量", 30, 300, 120, 10)
-        seed = st.number_input("随机种子", 0, 9999, 42, 1)
+    data_source = st.sidebar.radio("选择数据来源", ["模拟生成数据", "上传本地文件"], horizontal=True)
+
+    uploaded_batches = None
+    uploaded_temps = None
+    n_batches = 120
+    seed = 42
+
+    if data_source == "模拟生成数据":
+        with st.sidebar.expander("📦 模拟参数", expanded=False):
+            n_batches = st.slider("模拟批次数量", 30, 300, 120, 10)
+            seed = st.number_input("随机种子", 0, 9999, 42, 1)
+
+        st.sidebar.info("💡 使用内置算法生成模拟数据，含5个品类、5条线路，已注入脏数据")
+
+    else:
+        with st.sidebar.expander("📤 上传文件", expanded=True):
+            uploaded_batches = st.file_uploader(
+                "批次信息 (CSV/Excel)",
+                type=["csv", "xlsx", "xls"],
+                help=f"必需列: {', '.join(BATCHES_REQUIRED_COLS)}",
+            )
+            uploaded_temps = st.file_uploader(
+                "温度记录 (CSV/Excel)",
+                type=["csv", "xlsx", "xls"],
+                help=f"必需列: {', '.join(TEMPS_REQUIRED_COLS)}",
+            )
+
+            if uploaded_batches and uploaded_temps:
+                st.success("✅ 两个文件已上传")
+            elif uploaded_batches or uploaded_temps:
+                st.warning("⚠️ 请同时上传两个文件")
+
+    st.sidebar.divider()
+    st.sidebar.header("⚙️ 分析参数")
 
     with st.sidebar.expander("🎚️ 温度阈值调整", expanded=True):
         temp_overrides_min = {}
@@ -160,6 +236,9 @@ def build_sidebar():
     sel_risk = st.sidebar.multiselect("货架期风险等级", ["normal", "warning", "critical"], default=["normal", "warning", "critical"], format_func=lambda x: RISK_CN.get(x, x))
 
     return (
+        data_source,
+        uploaded_batches,
+        uploaded_temps,
         n_batches,
         seed,
         temp_overrides_min,
@@ -562,6 +641,21 @@ def plot_single_batch(
         st.dataframe(show_br, use_container_width=True, hide_index=True)
 
 
+def _show_empty_filter_warning():
+    st.warning(
+        "⚠️ **当前筛选条件下无匹配数据**\n\n"
+        "可能原因：\n"
+        "- 所选品类 / 线路 / 风险等级组合无交集\n"
+        "- 所选日期范围超出数据范围\n"
+        "- 上传的本地数据为空或格式不符\n\n"
+        "建议调整：\n"
+        "1. 扩大品类 / 线路 / 风险等级的选择范围\n"
+        "2. 调整采收日期范围\n"
+        "3. 检查上传文件是否包含匹配数据",
+        icon="📭",
+    )
+
+
 def main():
     st.set_page_config(page_title="生鲜冷链断链分析平台", layout="wide", page_icon="🥬")
     st.title("🥬 生鲜冷链断链分析平台")
@@ -569,13 +663,46 @@ def main():
 
     params = build_sidebar()
     (
+        data_source,
+        uploaded_batches,
+        uploaded_temps,
         n_batches, seed,
         tmin_override, tmax_override, safe_override,
         min_break_dur, delay_ratio,
         sel_categories, sel_lines, sel_risk,
     ) = params
 
-    batches_df, temps_df = load_data(n_batches, seed)
+    if data_source == "上传本地文件":
+        if uploaded_batches is None or uploaded_temps is None:
+            st.info("👆 请在左侧上传 **批次信息** 和 **温度记录** 两个文件后开始分析")
+            with st.expander("📋 文件格式说明", expanded=True):
+                st.markdown("**批次信息文件必需列：**")
+                st.code(", ".join(BATCHES_REQUIRED_COLS))
+                st.markdown("**温度记录文件必需列：**")
+                st.code(", ".join(TEMPS_REQUIRED_COLS))
+                st.info("💡 支持 CSV 或 Excel (.xlsx, .xls) 格式")
+            return
+
+        batches_df = _parse_uploaded_file(uploaded_batches, BATCHES_REQUIRED_COLS, "批次信息")
+        temps_df = _parse_uploaded_file(uploaded_temps, TEMPS_REQUIRED_COLS, "温度记录")
+        if batches_df is None or temps_df is None:
+            return
+        if batches_df.empty or temps_df.empty:
+            st.error("❌ 上传文件解析后为空，请检查文件内容")
+            return
+
+        common_bids = set(batches_df["batch_id"]) & set(temps_df["batch_id"])
+        if not common_bids:
+            st.error("❌ 批次信息和温度记录的 batch_id 无交集，请检查数据")
+            return
+
+        st.success(f"✅ 数据加载成功：{len(batches_df)} 个批次，{len(temps_df)} 条温度记录，{len(common_bids)} 个有效批次")
+    else:
+        batches_df, temps_df = load_data(n_batches, seed)
+
+    if batches_df.empty or temps_df.empty:
+        st.error("❌ 数据为空，请检查数据源")
+        return
 
     date_min = pd.Timestamp(batches_df["harvest_time"].min()).date()
     date_max = pd.Timestamp(batches_df["harvest_time"].max()).date()
@@ -610,6 +737,10 @@ def main():
         k4.metric("预警批次", len(sel_high_risk))
         k5.metric("数据问题", len(issues))
 
+    is_empty = len(sel_batches) == 0
+    if is_empty:
+        _show_empty_filter_warning()
+
     tab_overview, tab_loss, tab_risk, tab_detail = st.tabs([
         "🔍 断链概览",
         "📈 损耗归因",
@@ -618,7 +749,10 @@ def main():
     ])
 
     with tab_overview:
-        plot_stage_break_frequency(sel_breaks, sel_stage_summary)
+        if is_empty:
+            _show_empty_filter_warning()
+        else:
+            plot_stage_break_frequency(sel_breaks, sel_stage_summary)
         if issues:
             with st.expander(f"⚠️ 检测到 {len(issues)} 个数据问题 (点击展开)", expanded=False):
                 for iss in issues[:50]:
@@ -628,15 +762,23 @@ def main():
                     st.caption(f"... 另有 {len(issues) - 50} 条已省略")
 
     with tab_loss:
-        plot_loss_vs_break(sel_metrics)
-        plot_group_comparison(sel_batches, sel_metrics)
-        plot_factor_importance(sel_factor)
+        if is_empty:
+            _show_empty_filter_warning()
+        else:
+            plot_loss_vs_break(sel_metrics)
+            plot_group_comparison(sel_batches, sel_metrics)
+            plot_factor_importance(sel_factor)
 
     with tab_risk:
-        plot_high_risk(sel_high_risk, sel_sl)
+        if is_empty:
+            _show_empty_filter_warning()
+        else:
+            plot_high_risk(sel_high_risk, sel_sl)
 
     with tab_detail:
-        if len(sel_batches) > 0:
+        if is_empty:
+            _show_empty_filter_warning()
+        elif len(sel_batches) > 0:
             default_bid = sel_high_risk.iloc[0]["batch_id"] if not sel_high_risk.empty else sel_batches.iloc[0]["batch_id"]
             batch_id = st.selectbox(
                 "选择批次号查看完整轨迹",

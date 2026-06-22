@@ -28,6 +28,44 @@ class ChainBreak:
     severity_score: float = 0.0
 
 
+def _make_chain_break(
+    batch_id: str,
+    break_type: str,
+    stage: str,
+    stage_cn: str,
+    start_t: pd.Timestamp,
+    end_t: pd.Timestamp,
+    seg_temps: np.ndarray,
+    temp_min: float,
+    temp_max: float,
+) -> ChainBreak | None:
+    dur = (end_t - start_t).total_seconds() / 3600.0
+    if dur <= 0:
+        return None
+    avg_temp = float(np.mean(seg_temps))
+    if break_type == "temp_over_high":
+        exceed = float(np.mean(seg_temps - temp_max))
+        severity = (dur / 2.0) * (exceed / 3.0 + 1.0)
+    else:
+        exceed = float(np.mean(temp_min - seg_temps))
+        severity = (dur / 2.0) * (exceed / 3.0 + 1.0)
+    return ChainBreak(
+        batch_id=batch_id,
+        break_type=break_type,
+        stage=stage,
+        stage_cn=stage_cn,
+        start_time=start_t,
+        end_time=end_t,
+        duration_hours=round(dur, 3),
+        max_temp=round(float(np.max(seg_temps)), 2),
+        min_temp=round(float(np.min(seg_temps)), 2),
+        avg_temp=round(avg_temp, 2),
+        temp_threshold_min=round(temp_min, 2),
+        temp_threshold_max=round(temp_max, 2),
+        severity_score=round(severity, 3),
+    )
+
+
 def _detect_temp_breaks(
     trajectory: pd.DataFrame,
     temp_min: float,
@@ -58,70 +96,48 @@ def _detect_temp_breaks(
         if out_of_range[i] and not in_break:
             in_break = True
             break_start_idx = i
-            if above_max[i]:
-                break_type = "temp_over_high"
-            else:
-                break_type = "temp_over_low"
+            break_type = "temp_over_high" if above_max[i] else "temp_over_low"
             break_stage = stages[i]
             break_stage_cn = stages_cn[i]
+
+        elif in_break and stages[i] != break_stage and out_of_range[i]:
+            start_t = pd.Timestamp(times[break_start_idx])
+            end_t = pd.Timestamp(times[i - 1])
+            seg_temps = temps[break_start_idx:i]
+            br = _make_chain_break(
+                batch_id, break_type, break_stage, break_stage_cn,
+                start_t, end_t, seg_temps, temp_min, temp_max,
+            )
+            if br and br.duration_hours >= min_break_duration_hours:
+                breaks.append(br)
+
+            break_start_idx = i
+            break_type = "temp_over_high" if above_max[i] else "temp_over_low"
+            break_stage = stages[i]
+            break_stage_cn = stages_cn[i]
+
         elif not out_of_range[i] and in_break:
             in_break = False
             start_t = pd.Timestamp(times[break_start_idx])
             end_t = pd.Timestamp(times[i - 1])
-            dur = (end_t - start_t).total_seconds() / 3600.0
-            if dur >= min_break_duration_hours:
-                seg_temps = temps[break_start_idx:i]
-                avg_temp = float(np.mean(seg_temps))
-                if break_type == "temp_over_high":
-                    exceed = float(np.mean(seg_temps - temp_max))
-                    severity = (dur / 2.0) * (exceed / 3.0 + 1.0)
-                else:
-                    exceed = float(np.mean(temp_min - seg_temps))
-                    severity = (dur / 2.0) * (exceed / 3.0 + 1.0)
-                breaks.append(ChainBreak(
-                    batch_id=batch_id,
-                    break_type=break_type,
-                    stage=break_stage,
-                    stage_cn=break_stage_cn,
-                    start_time=start_t,
-                    end_time=end_t,
-                    duration_hours=round(dur, 3),
-                    max_temp=round(float(np.max(seg_temps)), 2),
-                    min_temp=round(float(np.min(seg_temps)), 2),
-                    avg_temp=round(avg_temp, 2),
-                    temp_threshold_min=round(temp_min, 2),
-                    temp_threshold_max=round(temp_max, 2),
-                    severity_score=round(severity, 3),
-                ))
+            seg_temps = temps[break_start_idx:i]
+            br = _make_chain_break(
+                batch_id, break_type, break_stage, break_stage_cn,
+                start_t, end_t, seg_temps, temp_min, temp_max,
+            )
+            if br and br.duration_hours >= min_break_duration_hours:
+                breaks.append(br)
 
     if in_break:
         start_t = pd.Timestamp(times[break_start_idx])
         end_t = pd.Timestamp(times[-1])
-        dur = (end_t - start_t).total_seconds() / 3600.0
-        if dur >= min_break_duration_hours:
-            seg_temps = temps[break_start_idx:]
-            avg_temp = float(np.mean(seg_temps))
-            if break_type == "temp_over_high":
-                exceed = float(np.mean(seg_temps - temp_max))
-                severity = (dur / 2.0) * (exceed / 3.0 + 1.0)
-            else:
-                exceed = float(np.mean(temp_min - seg_temps))
-                severity = (dur / 2.0) * (exceed / 3.0 + 1.0)
-            breaks.append(ChainBreak(
-                batch_id=batch_id,
-                break_type=break_type,
-                stage=break_stage,
-                stage_cn=break_stage_cn,
-                start_time=start_t,
-                end_time=end_t,
-                duration_hours=round(dur, 3),
-                max_temp=round(float(np.max(seg_temps)), 2),
-                min_temp=round(float(np.min(seg_temps)), 2),
-                avg_temp=round(avg_temp, 2),
-                temp_threshold_min=round(temp_min, 2),
-                temp_threshold_max=round(temp_max, 2),
-                severity_score=round(severity, 3),
-            ))
+        seg_temps = temps[break_start_idx:]
+        br = _make_chain_break(
+            batch_id, break_type, break_stage, break_stage_cn,
+            start_t, end_t, seg_temps, temp_min, temp_max,
+        )
+        if br and br.duration_hours >= min_break_duration_hours:
+            breaks.append(br)
 
     return breaks
 
